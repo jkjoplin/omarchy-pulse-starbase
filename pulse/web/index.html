@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omarchy Pulse</title>
+<!-- Omarchy Pulse: a live wallpaper for Omarchy. (c) 2026 Marco Porro (x.com/MarcoPorro), MIT. -->
+<link rel="stylesheet" href="pulse.css">
+<link rel="stylesheet" href="starbase.css">
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="vig"></div>
+<div id="ui">
+  <section id="left" class="col"></section>
+  <section id="center" class="col">
+    <div id="clock">
+      <div class="time"><span class="hm">--:--</span><span class="ss">--</span></div>
+      <div class="secbar"><i></i></div>
+      <div class="date"></div>
+      <div class="who"></div>
+    </div>
+    <div id="center-w"></div>
+  </section>
+  <section id="right" class="col"></section>
+</div>
+<div id="ticker"><div class="track"></div></div>
+<div id="badge"></div>
+<div id="incoming" hidden>
+  <div class="frame">
+    <div class="tag">▲ INCOMING</div>
+    <div class="title"></div>
+    <div class="text"></div>
+  </div>
+</div>
+<script src="engine-ring.js"></script>
+<script src="launchpad.js"></script>
+<script src="photo-gl.js"></script>
+<script src="starbase.js"></script>
+<script src="pulse.js"></script>
+</body>
+</html>

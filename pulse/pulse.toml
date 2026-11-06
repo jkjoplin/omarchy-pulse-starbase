@@ -1,0 +1,143 @@
+# Omarchy Pulse: what your wallpaper shows. Save this file and the wallpaper picks it up in a few seconds.
+# Every [[source]] below becomes a panel. Any data you can get from a command, a URL, a file, a stream or a
+# camera can live on your desktop; your own scripts go in ~/.config/omarchy-pulse/sources/ (it is on their PATH).
+# (c) 2026 Marco Porro (x.com/MarcoPorro), MIT.
+
+[pulse]
+city = ""                        # weather: "Milan", "Berlin"... (or latitude = 45.46 / longitude = 9.19)
+units = "metric"                 # or "imperial"
+clock = "24h"                    # or "12h"
+scene = "skyline"                # skyline | orbit | calm | starbase | launchpad
+# scenes = { starship = "starbase" }   # a scene per Omarchy theme (this one is the default: the Starship theme's
+                                       # photo comes alive); "launchpad" is a drawn version of the same idea
+fps = 20                         # on an empty desktop; it slows down by itself under windows and stops when
+                                 # something is full screen
+privacy_on_screenshare = true    # sharing or recording the screen hides cameras, notifications and private panels
+temp_crit = 90                   # °C: CPU temperature alert
+gpu = "auto"                     # "never" if the wallpaper is heavy on a PC without a working GPU driver
+# title = "MISSION CONTROL"      # a word under the clock
+# font = "CaskaydiaMono Nerd Font"
+# port = 47800
+
+[builtin]
+system = true
+network = true
+weather = true
+media = true                     # now playing (playerctl)
+notifications = true             # the last desktop notifications (mako); private
+github = ["basecamp/omarchy"]    # repos to follow: latest release and commits ([] to hide)
+github_notifications = true      # your GitHub notifications, when `gh auth login` is done
+
+# ---------------------------------------------------------------- your sources
+# Common keys: name (unique), title, slot = left|right|center|ticker|auto, order, every (seconds), timeout,
+# type = auto|stat|gauge|list|status|text|kv|chart|image, private = true (hidden while sharing the screen),
+# icon (a Nerd Font glyph), notify = true (also a desktop notification on alerts),
+# warn_above / crit_above / warn_below / crit_below (numbers: the panel turns amber/red and INCOMING plays).
+
+[[source]]
+name = "services"
+title = "systemd"
+icon = "󰒓"
+command = "pulse-systemd"        # failed system and user units (ships with Pulse)
+every = 60
+type = "status"
+slot = "right"
+
+[[source]]
+name = "ping"
+title = "network"
+icon = "󰛳"
+command = "pulse-ping gateway 1.1.1.1 github.com"   # 'gateway' = your router
+every = 20
+type = "status"
+slot = "right"
+
+# ---------------------------------------------------------------- examples: remove the # to turn one on
+
+# An AI reads everything on your wallpaper and tells you what matters (pulse-ai ships with Pulse).
+# Any CLI that takes a prompt works: "pulse-ai claude -p", "pulse-ai ollama run llama3.2" (local, nothing leaves
+# the PC), "pulse-ai codex exec", "pulse-ai gemini -p". Private panels are left out unless you add --private.
+# [[source]]
+# name = "ai"
+# title = "ai · brief"
+# icon = "󰚩"
+# command = "pulse-ai claude -p"
+# every = 1800
+# timeout = 180
+# slot = "center"
+
+# Or your own question, or any AI command at all:
+# [[source]]
+# name = "ai-servers"
+# title = "ai · servers"
+# command = "pulse-ai --ask 'Is anything wrong with my servers? One line.' ollama run llama3.2"
+# every = 900
+# timeout = 120
+
+# A security camera (RTSP, or any video ffmpeg can open): a live thumbnail, 2 frames a second
+# [[source]]
+# name = "cam-gate"
+# title = "cam · gate"
+# camera = "rtsp://user:password@192.168.1.50:554/stream2"
+# fps = 2
+# slot = "right"
+
+# Home Assistant: any entity (create a long-lived token in your profile)
+# [[source]]
+# name = "power"
+# title = "home · power"
+# icon = "󱐋"
+# url = "http://homeassistant.local:8123/api/states/sensor.house_power"
+# headers = { Authorization = "Bearer YOUR_TOKEN" }
+# path = "state"
+# type = "stat"
+# warn_above = 3000
+# every = 10
+
+# MQTT (one JSON or number per line keeps the panel live)
+# [[source]]
+# name = "garage"
+# stream = "mosquitto_sub -h 192.168.1.10 -t home/garage/temperature"
+# type = "stat"
+
+# A log that keeps going: the last 6 lines
+# [[source]]
+# name = "journal"
+# title = "errors"
+# stream = "journalctl -f -p err -o cat"
+# type = "text"
+# lines = 6
+# slot = "center"
+
+# Any JSON API (pick the part you want with path)
+# [[source]]
+# name = "btc"
+# title = "BTC"
+# url = "https://api.coinbase.com/v2/prices/BTC-EUR/spot"
+# path = "data.amount"
+# type = "stat"
+# every = 60
+
+# Pacman updates waiting (needs pacman-contrib)
+# [[source]]
+# name = "updates"
+# icon = "󰚰"
+# command = "checkupdates 2>/dev/null | wc -l"
+# warn_above = 50
+# every = 1800
+
+# Docker containers
+# [[source]]
+# name = "docker"
+# icon = ""
+# command = "docker ps --format '{{.Names}}\t{{.Status}}' | pulse-table"
+# every = 30
+
+# Something you push yourself, from anywhere:
+#   omarchy-pulse push deploy 72 --type gauge --title "deploy"
+#   make && omarchy-pulse push build ok --level ok || omarchy-pulse push build failed --level crit
+#   omarchy-pulse push snapshot ~/Pictures/latest.jpg
+# [[source]]
+# name = "deploy"
+# push = true
+# type = "gauge"

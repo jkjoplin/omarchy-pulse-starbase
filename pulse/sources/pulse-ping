@@ -1,0 +1,19 @@
+#!/bin/bash
+# Omarchy Pulse source: reachability of hosts as status tiles. "gateway" means your router.
+#   pulse-ping gateway 1.1.1.1 nas.local          (warn above 150 ms, crit when it does not answer)
+# (c) 2026 Marco Porro (x.com/MarcoPorro), MIT
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+i=0
+for h in "$@"; do
+  i=$((i+1)); label=$h; target=$h
+  if [[ $h == gateway ]]; then target=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}'); fi
+  ( if [[ -n $target ]] && out=$(ping -n -c1 -W2 "$target" 2>/dev/null); then
+      ms=$(grep -oE 'time=[0-9.]+' <<<"$out" | head -1 | cut -d= -f2)
+      ms=${ms:-0}; lvl=ok; [[ ${ms%.*} -gt 150 ]] && lvl=warn
+      printf '{"title":"%s","level":"%s","note":"%s ms"}' "$label" "$lvl" "${ms%.*}"
+    else printf '{"title":"%s","level":"crit","note":"no answer"}' "$label"; fi > "$tmp/$(printf %03d $i)" ) &
+done
+wait
+printf '{"items":['; first=1
+for f in "$tmp"/*; do [[ -f $f ]] || continue; ((first)) || printf ','; first=0; cat "$f"; done
+printf ']}\n'

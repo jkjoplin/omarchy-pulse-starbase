@@ -1,0 +1,53 @@
+#!/bin/bash
+# Omarchy Pulse: starts or stops the live wallpaper for the theme in use. (c) 2026 Marco Porro (x.com/MarcoPorro), MIT.
+# Starbase edition: also live with the Starship theme (github.com/jkjoplin/omarchy-pulse-starbase).
+#   pulse-live [theme]   theme-set hook ($1 = the new theme) or by hand
+#   pulse-live --login   from ~/.config/autostart at every login
+#   pulse-live --run     what the user unit runs
+# ~/.config/omarchy-pulse/live.conf: ALWAYS=1 keeps Pulse on with every theme (it takes that theme's colours);
+# LIVE_THEMES="pulse starship" are the themes it is live with otherwise (starship: the Starbase scene).
+unit=omarchy-pulse.service
+engine="$HOME/.local/share/omarchy-pulse/omarchy-pulse"
+conf="$HOME/.config/omarchy-pulse/live.conf"
+current_theme() {
+  local f="$HOME/.local/state/omarchy/current/theme.name" old="$HOME/.config/omarchy/current/theme"
+  if [[ -s $f ]]; then cat "$f"
+  elif [[ -s $HOME/.config/omarchy/current/theme.name ]]; then cat "$HOME/.config/omarchy/current/theme.name"
+  elif [[ -L $old ]]; then basename "$(readlink -f "$old")"
+  fi
+}
+ALWAYS=0
+LIVE_THEMES="pulse starship"
+[[ -f $conf ]] && . "$conf"
+mode=hook
+[[ ${1:-} == --login ]] && { mode=login; shift; }
+[[ ${1:-} == --run ]] && { mode=run; shift; }
+theme="${1:-$(current_theme)}"
+wanted() { [[ " $LIVE_THEMES " == *" $theme "* || $ALWAYS == 1 ]] && [[ -x $engine ]]; }
+
+if [[ $mode != run ]]; then
+  if wanted; then
+    # already running: it follows the new theme's colours by itself, no restart (no flash)
+    systemctl --user is-active -q "$unit" || systemctl --user start "$unit"
+  else
+    systemctl --user stop "$unit" 2>/dev/null
+  fi
+  exit 0
+fi
+
+# --run: find the live Wayland/Hyprland session (after an SSH login, a Hyprland restart or with a stale env)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ -z $WAYLAND_DISPLAY || ! -S $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ]]; then
+  WAYLAND_DISPLAY="$(command ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep -m1 -E '^wayland-[0-9]+$')"
+fi
+if [[ -z $HYPRLAND_INSTANCE_SIGNATURE || ! -d $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE ]]; then
+  HYPRLAND_INSTANCE_SIGNATURE="$(command ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -1)"
+fi
+export WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE GDK_BACKEND=wayland
+# exit 77 = nothing to do (the unit does not restart for it)
+wanted || exit 77
+[[ -n $WAYLAND_DISPLAY ]] || { echo "pulse-live: no Wayland session yet" >&2; exit 1; }
+# WebKitGTK draws nothing on some NVIDIA drivers with its DMA-BUF renderer
+[[ -e /proc/driver/nvidia/version ]] && export WEBKIT_DISABLE_DMABUF_RENDERER=1
+sleep 1   # let the desktop put its still background up first
+exec python3 "$engine" run

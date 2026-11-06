@@ -1,0 +1,1489 @@
+#!/usr/bin/env python3
+"""Omarchy Pulse: a live wallpaper for Omarchy. Any live data, drawn behind your windows.
+(c) 2026 Marco Porro (x.com/MarcoPorro), MIT. Made for Omarchy 4.5.
+Starbase edition (github.com/jkjoplin/omarchy-pulse-starbase): the Starship theme's photo comes alive (web/starbase.js),
+plus /bg (the current Omarchy background), per-theme scenes, stock-theme colours and a starbase demo profile.
+
+  omarchy-pulse run              the wallpaper: the local data hub plus a page on the bottom layer of every monitor
+  omarchy-pulse serve [--demo]   only the hub; open the printed URL in a browser (preview, debugging, demo data)
+  omarchy-pulse push NAME VALUE [--title T] [--type T] [--level ok|info|warn|crit] [--slot left|right|center|ticker]
+                                 send anything to the wallpaper from a script, a cron job, a git hook...
+  omarchy-pulse privacy on|off|auto|toggle
+  omarchy-pulse reload           re-read pulse.toml now (it is also re-read by itself when you save it)
+  omarchy-pulse doctor           check dependencies, config and sources
+
+Config: ~/.config/omarchy-pulse/pulse.toml (written on the first run; your own scripts go in
+~/.config/omarchy-pulse/sources/, which is on the PATH of every source command).
+
+Sources (each [[source]] in pulse.toml becomes one panel on the wallpaper):
+  command = "..."   run every `every` seconds; stdout is the data
+  stream  = "..."   a command that keeps running; every line it prints is an update (mosquitto_sub, journalctl -f...)
+  url     = "..."   GET every `every` seconds: JSON (pick a part with path = "a.b.0"), text, or an image
+  file    = "..."   read again when it changes (text, JSON or an image)
+  camera  = "..."   rtsp://, rtsps:// or http(s) video: a live thumbnail (ffmpeg); snapshot = true polls an image URL
+  push    = true    nothing to run: it waits for `omarchy-pulse push NAME ...` (any name can be pushed anyway)
+Output understood: a number ("42", "21.5 °C") -> a big stat with a sparkline; text -> a text panel (typed out);
+JSON: {"value", "unit"} stat, {"items": [...]} list, {"text"} text, {"rows": [[k, v]]} table, {"series"} chart,
+a JSON list -> list; any object may also set "title", "level" (ok/info/warn/crit) and "note".
+"""
+from __future__ import annotations
+
+import collections
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "1.0.0"
+HOME = Path.home()
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy-pulse"
+CONF = CONF_DIR / "pulse.toml"
+TOKEN_FILE = CONF_DIR / "token"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy-pulse"
+OMARCHY_CURRENT = HOME / ".local/state/omarchy/current"   # where Omarchy 4.5 puts the applied theme and background
+HERE = Path(__file__).resolve().parent
+WEB = HERE / "web"
+DEFAULT_PORT = 47800
+LEVELS = ("ok", "info", "warn", "crit")
+BUILTIN_IDS = {"sys", "net", "weather", "media", "notifications", "github"}
+HIST = 90   # points kept for sparklines
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def load_config() -> dict:
+    if not CONF.exists():
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        example = HERE / "pulse.toml"
+        if example.exists():
+            shutil.copy(example, CONF)
+    try:
+        with open(CONF, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:   # noqa: BLE001 - a typo in the config must not take the wallpaper down
+        log(f"pulse.toml: {e}")
+        return {"_error": str(e)}
+
+
+def token() -> str:
+    try:
+        t = TOKEN_FILE.read_text().strip()
+        if t:
+            return t
+    except FileNotFoundError:
+        pass
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    t = secrets.token_hex(16)
+    TOKEN_FILE.write_text(t + "\n")
+    os.chmod(TOKEN_FILE, 0o600)
+    return t
+
+
+# ---------------------------------------------------------------- parsing what a source prints
+
+NUM_RE = re.compile(r"^\s*(-?\d+(?:[.,]\d+)?)\s*([^\d\s][^\n]{0,11})?\s*$")
+
+
+def _level(v) -> str | None:
+    v = str(v or "").lower()
+    return {"warning": "warn", "critical": "crit", "error": "crit", "fail": "crit", "down": "crit", "up": "ok",
+            "good": "ok"}.get(v, v) if v else None
+
+
+def _items(lst) -> list:
+    out = []
+    for it in lst[:40]:
+        if isinstance(it, dict):
+            d = {k: it[k] for k in ("title", "text", "right", "note", "t", "value", "unit") if k in it}
+            d["title"] = str(it.get("title", it.get("name", it.get("label", it.get("summary", "")))))[:120]
+            if "text" in d:
+                d["text"] = str(d["text"])[:300]
+            lv = _level(it.get("level", it.get("status", "")))
+            if "ok" in it and lv is None:
+                lv = "ok" if it["ok"] else "crit"
+            if lv in LEVELS:
+                d["level"] = lv
+            out.append(d)
+        else:
+            out.append({"title": str(it)[:120]})
+    return out
+
+
+def parse_output(raw, want: str = "auto") -> dict:
+    """What a source printed -> {type, data, level?, title?}. Never raises."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    obj = raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return {"type": want if want != "auto" else "text", "data": {"text": ""}}
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            m = NUM_RE.match(s) if "\n" not in s else None
+            if m and want in ("auto", "stat", "gauge"):
+                return {"type": "gauge" if want == "gauge" else "stat",
+                        "data": {"value": float(m.group(1).replace(",", ".")), "unit": (m.group(2) or "").strip()}}
+            lines = s.splitlines()
+            if want in ("list", "status"):
+                return {"type": want, "data": {"items": _items(lines)}}
+            return {"type": "text", "data": {"text": s[:4000]}}
+    out: dict = {}
+    if isinstance(obj, bool):
+        return {"type": "status", "data": {"items": [{"title": "", "level": "ok" if obj else "crit"}]},
+                "level": "ok" if obj else "crit"}
+    if isinstance(obj, (int, float)):
+        return {"type": "gauge" if want == "gauge" else "stat", "data": {"value": obj, "unit": ""}}
+    if isinstance(obj, list):
+        t = want if want in ("list", "status") else "list"
+        return {"type": t, "data": {"items": _items(obj)}}
+    if not isinstance(obj, dict):
+        return {"type": "text", "data": {"text": str(obj)[:4000]}}
+    if "title" in obj:
+        out["title"] = str(obj["title"])[:60]
+    lv = _level(obj.get("level"))
+    if lv in LEVELS:
+        out["level"] = lv
+    data: dict = {}
+    if "note" in obj:
+        data["note"] = str(obj["note"])[:200]
+    t = obj.get("type") or want
+    if "items" in obj:
+        data["items"] = _items(obj["items"] if isinstance(obj["items"], list) else [])
+        t = t if t in ("list", "status") else "list"
+    elif "rows" in obj:
+        data["rows"] = [[str(a)[:40], str(b)[:80]] for a, b in (r[:2] for r in obj["rows"][:30] if len(r) >= 2)]
+        t = "kv"
+    elif "series" in obj:
+        data["series"] = obj["series"][:6]
+        t = "chart"
+    elif "value" in obj:
+        v = obj["value"]
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            pass
+        data["value"] = v
+        data["unit"] = str(obj.get("unit", ""))[:12]
+        for k in ("min", "max"):
+            if k in obj:
+                data[k] = obj[k]
+        t = t if t in ("stat", "gauge") else "stat"
+    elif "text" in obj:
+        data["text"] = str(obj["text"])[:4000]
+        t = "text"
+    elif "src" in obj or "image" in obj:
+        t = "image"
+    else:   # a plain object: show it as a table
+        data["rows"] = [[str(k)[:40], json.dumps(v) if isinstance(v, (dict, list)) else str(v)[:80]]
+                        for k, v in list(obj.items())[:30] if k not in ("title", "level")]
+        t = "kv"
+    out["type"] = t if t != "auto" else "text"
+    out["data"] = data
+    return out
+
+
+def dig(obj, path: str):
+    for part in [p for p in re.split(r"[.\[\]]", path or "") if p]:
+        if isinstance(obj, list):
+            obj = obj[int(part)]
+        elif isinstance(obj, dict):
+            obj = obj[part]
+        else:
+            raise KeyError(part)
+    return obj
+
+
+# ---------------------------------------------------------------- the hub
+
+class Hub:
+    def __init__(self, demo: bool = False):
+        self.demo = demo
+        self.lock = threading.RLock()
+        self.cfg: dict = {}
+        self.cfg_mtime = 0.0
+        self.gen = 0                      # bumped on every config reload: old source threads stop
+        self.widgets: dict[str, dict] = {}
+        self.images: dict[str, tuple[bytes, str, float]] = {}
+        self.alerts: collections.deque = collections.deque(maxlen=12)
+        self.alert_seq = 0
+        self.sys: dict = {}
+        self.hist = {k: collections.deque(maxlen=HIST) for k in ("cpu", "rx", "tx", "ram", "gpu", "temp")}
+        self.weather: dict | None = None
+        self.theme: dict = {}
+        self.mons: dict = {}
+        self.screencast = False
+        self.privacy_manual: bool | None = None
+        self.procs: list = []
+        self.hypr_dirty = threading.Event()
+        self.started = time.time()
+
+    # -- config
+    def conf(self, *keys, default=None):
+        d = self.cfg
+        for k in keys:
+            if not isinstance(d, dict) or k not in d:
+                return default
+            d = d[k]
+        return d
+
+    def reload(self, force: bool = False) -> None:
+        try:
+            m = CONF.stat().st_mtime
+        except FileNotFoundError:
+            m = 0
+        if not force and m == self.cfg_mtime and self.cfg:
+            return
+        self.cfg_mtime = m
+        cfg = load_config()
+        with self.lock:
+            self.cfg = cfg
+            self.gen += 1
+            gen = self.gen
+            for p in self.procs:
+                try:
+                    p.terminate()
+                except Exception:   # noqa: BLE001
+                    pass
+            self.procs = []
+            keep = BUILTIN_IDS
+            names = {str(s.get("name", "")) for s in cfg.get("source", []) if isinstance(s, dict)}
+            for k in list(self.widgets):
+                if k not in keep and k not in names and not self.widgets[k].get("pushed"):
+                    del self.widgets[k]
+        if cfg.get("_error"):
+            self.set_widget("pulse.toml", title="pulse.toml", type="text", slot="center", level="crit",
+                            data={"text": "Config error: " + cfg["_error"]})
+        else:
+            self.drop_widget("pulse.toml")
+        if self.demo:
+            return
+        for i, src in enumerate(cfg.get("source", [])):
+            if not isinstance(src, dict) or not src.get("name") or src.get("enabled") is False:
+                continue
+            src = dict(src)
+            src["_order"] = i
+            threading.Thread(target=self.run_source, args=(src, gen), daemon=True).start()
+        log(f"config loaded: {len([s for s in cfg.get('source', []) if isinstance(s, dict)])} sources")
+
+    # -- widgets
+    def set_widget(self, wid: str, **f) -> None:
+        notify = None
+        with self.lock:
+            w = self.widgets.get(wid) or {"id": wid, "title": wid, "type": "text", "slot": "auto", "data": {}}
+            old = w.get("level")
+            w.update({k: v for k, v in f.items() if v is not None})
+            w["updated"] = time.time()
+            if f.get("error") is None:
+                w.pop("error", None)
+            d = w.get("data") or {}
+            if w.get("type") in ("stat", "gauge") and isinstance(d.get("value"), (int, float)):
+                h = w.setdefault("_hist", collections.deque(maxlen=HIST))
+                h.append(d["value"])
+                d["history"] = list(h)
+                rules = w.get("_rules") or {}
+                lv = None
+                for name, lvl, cmp in (("crit_above", "crit", 1), ("crit_below", "crit", -1),
+                                       ("warn_above", "warn", 1), ("warn_below", "warn", -1)):
+                    if name in rules and lv is None:
+                        if (cmp > 0 and d["value"] > rules[name]) or (cmp < 0 and d["value"] < rules[name]):
+                            lv = lvl
+                if rules:
+                    w["level"] = lv or "ok"
+            new = w.get("level")
+            if new in ("warn", "crit") and new != old:
+                self.alert_seq += 1
+                txt = ""
+                if isinstance(d.get("value"), (int, float)):
+                    txt = f"{d['value']:g} {d.get('unit', '')}".strip()
+                elif d.get("text"):
+                    txt = str(d["text"]).splitlines()[0][:120]
+                elif d.get("items"):
+                    bad = [i for i in d["items"] if i.get("level") in ("warn", "crit")]
+                    txt = ", ".join(i.get("title", "") for i in (bad or d["items"])[:4])
+                elif d.get("note"):
+                    txt = d["note"]
+                self.alerts.append({"seq": self.alert_seq, "id": wid, "title": w.get("title", wid), "text": txt,
+                                    "level": new, "t": time.time()})
+                if w.get("_notify"):
+                    notify = (w.get("title", wid), txt, new)
+            self.widgets[wid] = w
+        if notify and shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", "-u", "critical" if notify[2] == "crit" else "normal",
+                              "Pulse · " + notify[0], notify[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def drop_widget(self, wid: str) -> None:
+        with self.lock:
+            self.widgets.pop(wid, None)
+            self.images.pop(wid, None)
+
+    def widget_error(self, wid: str, msg: str) -> None:
+        with self.lock:
+            w = self.widgets.get(wid)
+            if w:
+                w["error"] = re.sub(r"://[^/@\s]+@", "://***@", msg)[:200]   # never show a camera password
+
+    def apply(self, src: dict, raw) -> None:
+        p = parse_output(raw, src.get("type", "auto"))
+        base = self.src_fields(src)
+        if src.get("title"):
+            p.pop("title", None)
+        self.set_widget(src["name"], **{**base, **p, "error": None})
+
+    @staticmethod
+    def src_fields(src: dict) -> dict:
+        f = {"title": src.get("title", src["name"]), "slot": src.get("slot", "auto"),
+             "order": src.get("order", src.get("_order", 50)), "private": bool(src.get("private", False)),
+             "icon": src.get("icon"), "size": src.get("size"),
+             "_rules": {k: src[k] for k in ("warn_above", "crit_above", "warn_below", "crit_below") if k in src},
+             "_notify": bool(src.get("notify", False))}
+        if src.get("unit"):
+            f["unit_override"] = src["unit"]
+        return f
+
+    # -- sources
+    def alive(self, gen: int) -> bool:
+        return gen == self.gen
+
+    def run_source(self, src: dict, gen: int) -> None:
+        name = src["name"]
+        every = max(1.0, float(src.get("every", 30)))
+        try:
+            if "stream" in src:
+                return self.src_stream(src, gen)
+            if "camera" in src and not src.get("snapshot"):
+                return self.src_camera(src, gen)
+            if src.get("push"):
+                self.set_widget(name, **self.src_fields(src), type=src.get("type", "text"),
+                                data={"text": "waiting for: omarchy-pulse push " + name + " ..."})
+                return
+        except Exception as e:   # noqa: BLE001
+            self.widget_error(name, str(e))
+            return
+        last_mtime = None
+        while self.alive(gen):
+            try:
+                if "command" in src:
+                    r = subprocess.run(["bash", "-c", src["command"]], capture_output=True, timeout=float(src.get("timeout", 60)),
+                                       env=self.src_env())
+                    if r.returncode != 0 and not r.stdout.strip():
+                        raise RuntimeError((r.stderr.decode(errors="replace").strip() or f"exit {r.returncode}")[-200:])
+                    if self.alive(gen):
+                        self.apply(src, r.stdout)
+                elif "url" in src or "camera" in src:
+                    url = src.get("url") or src["camera"]
+                    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-pulse/" + VERSION,
+                                                               **{k: str(v) for k, v in (src.get("headers") or {}).items()}})
+                    with urllib.request.urlopen(req, timeout=float(src.get("timeout", 20))) as resp:
+                        ctype = resp.headers.get("Content-Type", "")
+                        body = resp.read(8_000_000)
+                    if ctype.startswith("image/") or "camera" in src:
+                        self.put_image(src, body, ctype or "image/jpeg")
+                    else:
+                        try:
+                            obj = json.loads(body)
+                            if src.get("path"):
+                                obj = dig(obj, src["path"])
+                            self.apply(src, json.dumps(obj) if not isinstance(obj, str) else obj)
+                        except ValueError:
+                            self.apply(src, body)
+                elif "file" in src:
+                    fp = Path(os.path.expanduser(src["file"]))
+                    m = fp.stat().st_mtime
+                    if m != last_mtime:
+                        last_mtime = m
+                        if fp.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                            self.put_image(src, fp.read_bytes(), "image/" + fp.suffix.lower().lstrip(".").replace("jpg", "jpeg"))
+                        else:
+                            self.apply(src, fp.read_bytes()[:200_000])
+                    every = min(every, 2.0)
+                else:
+                    self.set_widget(name, **self.src_fields(src), type="text",
+                                    data={"text": "no command, stream, url, file or camera"}, level="warn")
+                    return
+            except Exception as e:   # noqa: BLE001
+                if self.alive(gen):
+                    if name not in self.widgets:
+                        self.set_widget(name, **self.src_fields(src), type="text", data={"text": ""})
+                    self.widget_error(name, str(e))
+            end = time.time() + every
+            while self.alive(gen) and time.time() < end:
+                time.sleep(0.5)
+
+    def src_env(self) -> dict:
+        env = dict(os.environ)
+        env["PATH"] = f"{CONF_DIR / 'sources'}:{HERE / 'sources'}:{env.get('PATH', '/usr/bin')}"
+        env["PULSE_THEME"] = self.theme.get("name", "")
+        return env
+
+    def put_image(self, src: dict, body: bytes, ctype: str) -> None:
+        with self.lock:
+            self.images[src["name"]] = (body, ctype, time.time())
+        f = {**self.src_fields(src), "type": "image", "private": bool(src.get("private", True)), "error": None,
+             "data": {"src": "/img/" + urllib.parse.quote(src["name"]), "live": "camera" in src}}
+        self.set_widget(src["name"], **f)
+
+    def src_stream(self, src: dict, gen: int) -> None:
+        backoff = 3
+        while self.alive(gen):
+            try:
+                p = subprocess.Popen(["bash", "-c", src["stream"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     env=self.src_env(), start_new_session=True)
+                with self.lock:
+                    self.procs.append(p)
+                acc = []
+                for line in p.stdout:
+                    if not self.alive(gen):
+                        break
+                    s = line.decode("utf-8", "replace").rstrip("\n")
+                    if src.get("type") in ("list", "status") and not s.lstrip().startswith(("{", "[")):
+                        acc = (acc + [s])[-int(src.get("lines", 8)):]   # a log: the last lines
+                        self.apply(src, "\n".join(acc))
+                    elif src.get("type") == "text" and not s.lstrip().startswith("{"):
+                        acc = (acc + [s])[-int(src.get("lines", 8)):]
+                        self.apply(src, "\n".join(acc))
+                    else:
+                        self.apply(src, s)
+                    backoff = 3
+                p.wait(timeout=2)
+                err = p.stderr.read().decode(errors="replace").strip()[-200:] if p.stderr else ""
+                if self.alive(gen):
+                    self.widget_error(src["name"], err or f"stream ended (exit {p.returncode})")
+            except Exception as e:   # noqa: BLE001
+                if self.alive(gen):
+                    self.widget_error(src["name"], str(e))
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def src_camera(self, src: dict, gen: int) -> None:
+        """One ffmpeg per camera, kept open: a few JPEG frames a second split out of an MJPEG pipe."""
+        if not shutil.which("ffmpeg"):
+            self.set_widget(src["name"], **self.src_fields(src), type="image", data={}, level="warn")
+            self.widget_error(src["name"], "ffmpeg is not installed")
+            return
+        fps = float(src.get("fps", 2))
+        width = int(src.get("width", 640))
+        url = src["camera"]
+        backoff = 3
+        while self.alive(gen):
+            args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+            if url.startswith(("rtsp://", "rtsps://")):
+                args += ["-rtsp_transport", src.get("transport", "tcp")]
+            args += ["-i", url, "-an", "-vf", f"fps={fps},scale={width}:-2", "-f", "image2pipe", "-c:v", "mjpeg",
+                     "-q:v", "6", "-"]
+            try:
+                p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                with self.lock:
+                    self.procs.append(p)
+                buf = b""
+                while self.alive(gen):
+                    chunk = p.stdout.read1(65536) if hasattr(p.stdout, "read1") else p.stdout.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while True:
+                        a = buf.find(b"\xff\xd8")
+                        b = buf.find(b"\xff\xd9", a + 2)
+                        if a < 0 or b < 0:
+                            break
+                        self.put_image(src, buf[a:b + 2], "image/jpeg")
+                        buf = buf[b + 2:]
+                        backoff = 3
+                    if len(buf) > 4_000_000:
+                        buf = b""
+                p.kill()
+                err = p.stderr.read().decode(errors="replace").strip()[-160:]
+                if self.alive(gen):
+                    if src["name"] not in self.widgets:
+                        self.set_widget(src["name"], **self.src_fields(src), type="image", data={})
+                    self.widget_error(src["name"], err or "camera stream ended")
+            except Exception as e:   # noqa: BLE001
+                if self.alive(gen):
+                    self.widget_error(src["name"], str(e))
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def push(self, name: str, body: bytes, q: dict) -> None:
+        name = re.sub(r"[^\w.\- ]", "", name)[:40] or "push"
+        configured = next((s for s in self.cfg.get("source", []) if isinstance(s, dict) and s.get("name") == name), None)
+        src = dict(configured or {"name": name})
+        if not configured:   # a panel made by an earlier push keeps its title, place and order
+            old = self.widgets.get(name) or {}
+            for k in ("title", "slot", "order", "icon", "private"):
+                if k in old and old[k] is not None:
+                    src.setdefault(k, old[k])
+            if "type" in old and not q.get("type") and old["type"] not in ("text",):
+                src.setdefault("type", old["type"])
+        for k in ("title", "type", "slot", "level", "order"):
+            if q.get(k):
+                src[k] = int(q[k]) if k == "order" and str(q[k]).isdigit() else q[k]
+        ctype = q.get("_ctype", "")
+        if ctype.startswith("image/"):
+            self.put_image(src, body, ctype)
+            return
+        p = parse_output(body, src.get("type", "auto"))
+        if src.get("title"):
+            p.pop("title", None)
+        f = {**self.src_fields(src), **p, "pushed": True, "error": None}
+        if q.get("level") in LEVELS:
+            f["level"] = q["level"]
+        self.set_widget(name, **f)
+
+    # -- built-ins
+    def builtin(self, key: str, default=True):
+        return self.conf("builtin", key, default=default)
+
+    def loop_system(self) -> None:
+        prev_cpu = None
+        prev_net = None
+        prev_t = time.time()
+        gpu_t = 0.0
+        gpu = None
+        while True:
+            try:
+                now = time.time()
+                with open("/proc/stat") as f:
+                    lines = [l.split() for l in f if l.startswith("cpu")]
+                cur = [(sum(map(int, l[1:9])), int(l[4]) + int(l[5])) for l in lines]
+                cpu, cores = 0.0, []
+                if prev_cpu and len(prev_cpu) == len(cur):
+                    for i, ((tot, idle), (ptot, pidle)) in enumerate(zip(cur, prev_cpu)):
+                        dt = tot - ptot
+                        v = 0.0 if dt <= 0 else 100.0 * (1 - (idle - pidle) / dt)
+                        if i == 0:
+                            cpu = v
+                        else:
+                            cores.append(round(v, 1))
+                prev_cpu = cur
+                mem = {}
+                with open("/proc/meminfo") as f:
+                    for l in f:
+                        k, v = l.split(":", 1)
+                        mem[k] = int(v.split()[0])
+                tot = mem.get("MemTotal", 1)
+                used = tot - mem.get("MemAvailable", tot)
+                swap_t = mem.get("SwapTotal", 0)
+                swap = 0 if not swap_t else 100 * (swap_t - mem.get("SwapFree", 0)) / swap_t
+                rx = tx = 0
+                with open("/proc/net/dev") as f:
+                    for l in list(f)[2:]:
+                        iface, data = l.split(":", 1)
+                        if iface.strip() == "lo" or iface.strip().startswith(("veth", "docker", "br-", "virbr")):
+                            continue
+                        d = data.split()
+                        rx += int(d[0])
+                        tx += int(d[8])
+                dt = max(0.5, now - prev_t)
+                rxr = txr = 0.0
+                if prev_net:
+                    rxr = max(0, rx - prev_net[0]) / dt
+                    txr = max(0, tx - prev_net[1]) / dt
+                prev_net, prev_t = (rx, tx), now
+                if now - gpu_t > 4:
+                    gpu_t = now
+                    gpu = read_gpu()
+                temp = read_temp()
+                du = shutil.disk_usage("/")
+                with open("/proc/loadavg") as f:
+                    load = f.read().split()[:3]
+                with open("/proc/uptime") as f:
+                    up = float(f.read().split()[0])
+                bat = read_battery()
+                s = {"cpu": round(cpu, 1), "cores": cores, "ram": round(100 * used / tot, 1),
+                     "ramUsed": used * 1024, "ramTotal": tot * 1024, "swap": round(swap, 1), "gpu": gpu, "temp": temp,
+                     "disk": round(100 * du.used / du.total, 1), "diskFree": du.free, "load": load, "uptime": up,
+                     "rx": rxr, "tx": txr, "bat": bat, "ip": local_ip(), "host": socket.gethostname(),
+                     "user": os.environ.get("USER", "")}
+                with self.lock:
+                    self.sys = s
+                    for k, v in (("cpu", cpu), ("rx", rxr), ("tx", txr), ("ram", s["ram"]), ("gpu", gpu or 0),
+                                 ("temp", temp or 0)):
+                        self.hist[k].append(round(v, 1))
+                # built-in alerts: a hot CPU, a full disk
+                if temp:
+                    self.edge_alert("temp", "CPU temperature", temp >= float(self.conf("pulse", "temp_crit", default=90)),
+                                    f"{temp:.0f} °C")
+                self.edge_alert("disk", "Disk /", s["disk"] >= 95, f"{s['disk']:.0f}% used")
+            except Exception as e:   # noqa: BLE001
+                log(f"system: {e}")
+            time.sleep(2)
+
+    _edges: dict = {}
+
+    def edge_alert(self, key: str, title: str, bad: bool, text: str) -> None:
+        if bad and not self._edges.get(key):
+            with self.lock:
+                self.alert_seq += 1
+                self.alerts.append({"seq": self.alert_seq, "id": key, "title": title, "text": text, "level": "crit",
+                                    "t": time.time()})
+        self._edges[key] = bad
+
+    def loop_weather(self) -> None:
+        geo = None
+        while True:
+            wait = 900
+            try:
+                if self.builtin("weather") is not False:
+                    lat, lon = self.conf("pulse", "latitude"), self.conf("pulse", "longitude")
+                    city = str(self.conf("pulse", "city", default="") or "")
+                    if lat is None and city:
+                        if not geo or geo[0] != city:
+                            j = http_json("https://geocoding-api.open-meteo.com/v1/search?count=1&name=" +
+                                          urllib.parse.quote(city))
+                            r = (j.get("results") or [None])[0]
+                            geo = (city, r["latitude"], r["longitude"], r.get("name", city)) if r else (city, None, None, city)
+                        _, lat, lon, label = geo
+                    else:
+                        label = city or (f"{lat:.2f}, {lon:.2f}" if lat is not None else "")
+                    if lat is None:
+                        self.weather = {"city": city, "error": "set city = \"...\" in pulse.toml" if not city else
+                                        f"city not found: {city}"}
+                    else:
+                        imperial = self.conf("pulse", "units", default="metric") == "imperial"
+                        q = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                             "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,is_day,precipitation"
+                             "&hourly=temperature_2m,precipitation_probability,weather_code"
+                             "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset&timezone=auto&forecast_days=2")
+                        if imperial:
+                            q += "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+                        j = http_json(q)
+                        cur = j["current"]
+                        hours = []
+                        ht = j["hourly"]["time"]
+                        nowiso = cur["time"][:13]
+                        start = next((i for i, t in enumerate(ht) if t[:13] >= nowiso), 0)
+                        for i in range(start, min(start + 24, len(ht))):
+                            hours.append({"h": ht[i][11:13], "t": j["hourly"]["temperature_2m"][i],
+                                          "p": j["hourly"]["precipitation_probability"][i],
+                                          "c": j["hourly"]["weather_code"][i]})
+                        self.weather = {"city": label, "temp": cur["temperature_2m"], "feels": cur["apparent_temperature"],
+                                        "code": cur["weather_code"], "wind": cur["wind_speed_10m"],
+                                        "hum": cur["relative_humidity_2m"], "day": cur["is_day"],
+                                        "rain": cur.get("precipitation", 0),
+                                        "hi": j["daily"]["temperature_2m_max"][0], "lo": j["daily"]["temperature_2m_min"][0],
+                                        "sunrise": j["daily"]["sunrise"][0][11:16], "sunset": j["daily"]["sunset"][0][11:16],
+                                        "unit": "°F" if imperial else "°C", "windUnit": "mph" if imperial else "km/h",
+                                        "hours": hours, "t": time.time()}
+                else:
+                    self.weather = None
+            except Exception as e:   # noqa: BLE001
+                log(f"weather: {e}")
+                if self.weather:
+                    self.weather["stale"] = True
+                wait = 120
+            self.sleep_or_reload(wait)
+
+    def sleep_or_reload(self, secs: float) -> None:
+        g = self.gen
+        end = time.time() + secs
+        while time.time() < end and self.gen == g:
+            time.sleep(1)
+
+    def loop_github(self) -> None:
+        while True:
+            repos = self.builtin("github", default=["basecamp/omarchy"])
+            notif = self.builtin("github_notifications", default=True)
+            items = []
+            try:
+                if isinstance(repos, str):
+                    repos = [repos]
+                for repo in (repos or [])[:4]:
+                    rel = gh_api(f"repos/{repo}/releases?per_page=1")
+                    if rel:
+                        r = rel[0]
+                        items.append({"title": f"{repo} · {r.get('tag_name', '')}", "text": (r.get("name") or "release")[:80],
+                                      "t": iso_ts(r.get("published_at")), "level": "info"})
+                    for c in (gh_api(f"repos/{repo}/commits?per_page=3") or [])[:3]:
+                        msg = (c.get("commit", {}).get("message") or "").splitlines()[0][:90]
+                        items.append({"title": msg, "text": repo + " · " + ((c.get("author") or {}).get("login") or ""),
+                                      "t": iso_ts(c.get("commit", {}).get("author", {}).get("date"))})
+                if notif and shutil.which("gh"):
+                    ns = gh_api("notifications?per_page=6", auth_only=True) or []
+                    for n in ns[:5]:
+                        items.insert(0, {"title": n.get("subject", {}).get("title", "")[:90],
+                                         "text": n.get("repository", {}).get("full_name", "") + " · " +
+                                         n.get("subject", {}).get("type", ""), "t": iso_ts(n.get("updated_at")),
+                                         "level": "warn" if n.get("reason") in ("review_requested", "security_alert") else "info"})
+                if items:
+                    self.set_widget("github", title="github", type="list", slot=self.builtin("github_slot", "right"),
+                                    order=self.builtin("github_order", 30), data={"items": items[:8]}, icon="")
+                else:
+                    self.drop_widget("github")
+            except Exception as e:   # noqa: BLE001
+                log(f"github: {e}")
+            self.sleep_or_reload(600)
+
+    def loop_media(self) -> None:
+        while True:
+            try:
+                if self.builtin("media") is not False and shutil.which("playerctl"):
+                    r = subprocess.run(["playerctl", "metadata", "--format",
+                                        "{{status}}\t{{artist}}\t{{title}}\t{{position}}\t{{mpris:length}}\t{{playerName}}"],
+                                       capture_output=True, text=True, timeout=3)
+                    parts = r.stdout.strip().split("\t")
+                    if r.returncode == 0 and len(parts) >= 6 and parts[0] in ("Playing", "Paused"):
+                        pos = int(parts[3] or 0) / 1e6
+                        ln = int(parts[4] or 0) / 1e6
+                        self.set_widget("media", title="now playing", type="media", slot="left", order=20,
+                                        data={"status": parts[0], "artist": parts[1], "title": parts[2], "pos": pos,
+                                              "len": ln, "player": parts[5]})
+                    else:
+                        self.drop_widget("media")
+            except Exception:   # noqa: BLE001
+                self.drop_widget("media")
+            time.sleep(3)
+
+    def loop_notifications(self) -> None:
+        while True:
+            try:
+                if self.builtin("notifications") is not False and shutil.which("makoctl"):
+                    items = mako_history()
+                    if items:
+                        self.set_widget("notifications", title="notifications", type="list", slot="center", order=40,
+                                        private=True, data={"items": items[:5]})
+                    else:
+                        self.drop_widget("notifications")
+            except Exception:   # noqa: BLE001
+                pass
+            time.sleep(5)
+
+    def loop_theme(self) -> None:
+        while True:
+            try:
+                t = read_theme()
+                with self.lock:
+                    self.theme = t
+            except Exception as e:   # noqa: BLE001
+                log(f"theme: {e}")
+            try:
+                self.reload()
+            except Exception as e:   # noqa: BLE001
+                log(f"reload: {e}")
+            time.sleep(3)
+
+    # -- Hyprland: windows on each monitor's workspace (the wallpaper calms down) and screen sharing (privacy)
+    def loop_hypr(self) -> None:
+        threading.Thread(target=self.loop_hypr_refresh, daemon=True).start()
+        while True:
+            path = hypr_socket()
+            if not path:
+                time.sleep(5)
+                continue
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(path)
+                self.hypr_dirty.set()
+                buf = b""
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    *lines, buf = buf.split(b"\n")
+                    for line in lines:
+                        ev, _, arg = line.decode("utf-8", "replace").partition(">>")
+                        if ev == "screencast":
+                            on = arg.split(",")[0] == "1"
+                            if on != self.screencast:
+                                log("screen sharing " + ("started: privacy on" if on else "stopped"))
+                            self.screencast = on
+                        elif ev in ("workspace", "workspacev2", "openwindow", "closewindow", "movewindow", "movewindowv2",
+                                    "fullscreen", "focusedmon", "focusedmonv2", "changefloatingmode", "monitoradded",
+                                    "monitorremoved", "activespecial", "minimized"):
+                            self.hypr_dirty.set()
+                s.close()
+            except Exception:   # noqa: BLE001
+                pass
+            time.sleep(2)
+
+    def loop_hypr_refresh(self) -> None:
+        while True:
+            self.hypr_dirty.wait(10)
+            time.sleep(0.25)
+            self.hypr_dirty.clear()
+            try:
+                mons = json.loads(subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, timeout=3,
+                                                 env=hypr_env()).stdout or b"[]")
+                wss = {w["id"]: w for w in json.loads(subprocess.run(["hyprctl", "-j", "workspaces"], capture_output=True,
+                                                                     timeout=3, env=hypr_env()).stdout or b"[]")}
+                out = {}
+                for m in mons:
+                    w = wss.get((m.get("activeWorkspace") or {}).get("id"), {})
+                    sp = (m.get("specialWorkspace") or {}).get("id")
+                    out[f"{m.get('x', 0)},{m.get('y', 0)}"] = {"name": m.get("name"), "windows": w.get("windows", 0),
+                                                              "fullscreen": bool(w.get("hasfullscreen")) or bool(sp)}
+                with self.lock:
+                    self.mons = out
+            except Exception:   # noqa: BLE001
+                pass
+
+    # -- privacy
+    def privacy(self) -> bool:
+        if self.privacy_manual is not None:
+            return self.privacy_manual
+        return self.screencast and self.conf("pulse", "privacy_on_screenshare", default=True) is not False
+
+    # -- what the page reads
+    def state(self) -> dict:
+        with self.lock:
+            ws = []
+            for w in self.widgets.values():
+                d = {k: v for k, v in w.items() if not k.startswith("_")}
+                if w["id"] in self.images:
+                    d["data"] = {**d.get("data", {}), "frame": self.images[w["id"]][2]}
+                ws.append(d)
+            return {"v": VERSION, "t": time.time(), "demo": self.demo, "sys": self.sys,
+                    "hist": {k: list(v) for k, v in self.hist.items()}, "weather": self.weather,
+                    "widgets": ws, "alerts": list(self.alerts), "privacy": self.privacy(), "screencast": self.screencast,
+                    "mons": self.mons, "theme": self.theme, "bg": background_info(),
+                    "ui": {"fps": self.conf("pulse", "fps", default=20), "clock": self.conf("pulse", "clock", default="24h"),
+                           "scene": self.conf("pulse", "scene", default="skyline"),
+                           "scenes": {"starship": "starbase", **(self.conf("pulse", "scenes", default={}) or {})},
+                           "font": self.conf("pulse", "font", default=""),
+                           "title": self.conf("pulse", "title", default=""),
+                           "dim_with_windows": self.conf("pulse", "dim_with_windows", default=True),
+                           "system": self.builtin("system") is not False, "network": self.builtin("network") is not False}}
+
+    def start(self) -> None:
+        self.reload(force=True)
+        if self.demo:
+            from_demo(self)
+            return
+        for fn in (self.loop_system, self.loop_weather, self.loop_github, self.loop_media, self.loop_notifications,
+                   self.loop_theme, self.loop_hypr):
+            threading.Thread(target=fn, daemon=True).start()
+
+
+# ---------------------------------------------------------------- small readers
+
+def read_gpu():
+    for p in Path("/sys/class/drm").glob("card*/device/gpu_busy_percent"):
+        try:
+            return float(p.read_text().strip())
+        except Exception:   # noqa: BLE001
+            pass
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=3)
+            return float(r.stdout.split()[0])
+        except Exception:   # noqa: BLE001
+            pass
+    return None
+
+
+def read_temp():
+    best = None
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            name = (hw / "name").read_text().strip()
+        except Exception:   # noqa: BLE001
+            continue
+        if name not in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz", "macsmc_hwmon", "thinkpad"):
+            continue
+        for t in hw.glob("temp*_input"):
+            try:
+                v = int(t.read_text()) / 1000
+                if 0 < v < 130:
+                    best = v if best is None else max(best, v)
+            except Exception:   # noqa: BLE001
+                pass
+    return round(best, 1) if best is not None else None
+
+
+def read_battery():
+    # BAT0 on most laptops, macsmc-battery on Apple Silicon. Mice and headsets are batteries too, with scope Device.
+    for b in sorted(Path("/sys/class/power_supply").glob("*")):
+        try:
+            if (b / "type").read_text().strip() != "Battery":
+                continue
+            if (b / "scope").exists() and (b / "scope").read_text().strip() == "Device":
+                continue
+            return {"pct": int((b / "capacity").read_text()), "status": (b / "status").read_text().strip()}
+        except Exception:   # noqa: BLE001
+            pass
+    return None
+
+
+_ip_cache = ("", 0.0)
+
+
+def local_ip() -> str:
+    global _ip_cache
+    if time.time() - _ip_cache[1] < 30:
+        return _ip_cache[0]
+    ip = ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))   # no packet is sent: it only picks the outgoing interface
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:   # noqa: BLE001
+        pass
+    _ip_cache = (ip, time.time())
+    return ip
+
+
+def http_json(url: str, headers: dict | None = None):
+    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-pulse/" + VERSION, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def gh_api(path: str, auth_only: bool = False):
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "api", path], capture_output=True, timeout=20)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        if auth_only:
+            return None
+    if auth_only:
+        return None
+    return http_json("https://api.github.com/" + path, {"Accept": "application/vnd.github+json"})
+
+
+def iso_ts(s):
+    if not s:
+        return None
+    try:
+        import datetime as dt
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def mako_history() -> list:
+    r = subprocess.run(["makoctl", "history"], capture_output=True, text=True, timeout=3)
+    out = r.stdout.strip()
+    items = []
+    try:   # older mako: JSON
+        j = json.loads(out)
+        for n in (j.get("data") or [[]])[0]:
+            items.append({"title": n.get("summary", {}).get("data", ""), "text": n.get("body", {}).get("data", "")[:160],
+                          "right": n.get("app-name", {}).get("data", "")})
+        return items
+    except ValueError:
+        pass
+    cur = None
+    for line in out.splitlines():   # mako 1.9+: text
+        m = re.match(r"^Notification \d+: (.*)$", line)
+        if m:
+            cur = {"title": m.group(1)}
+            items.append(cur)
+        elif cur is not None:
+            k, _, v = line.strip().partition(": ")
+            if k == "App name":
+                cur["right"] = v
+            elif k == "Body" or (not v and line.startswith("  ") and "text" not in cur and k):
+                cur["text"] = (v or k)[:160]
+    return items
+
+
+def theme_name() -> str:
+    for f in (HOME / ".local/state/omarchy/current/theme.name", HOME / ".config/omarchy/current/theme.name"):
+        if f.is_file() and f.read_text().strip():
+            return f.read_text().strip()
+    old = HOME / ".config/omarchy/current/theme"
+    if old.is_symlink() or old.is_dir():
+        return old.resolve().name
+    return ""
+
+
+_theme_cache: dict = {}
+
+
+def read_theme() -> dict:
+    name = theme_name()
+    # Omarchy 4.5+ keeps the applied theme under ~/.local/state; stock themes live in /usr/share/omarchy/themes
+    for d in (OMARCHY_CURRENT / "theme", HOME / ".config/omarchy/current/theme",
+              HOME / ".config/omarchy/themes" / name, HOME / ".local/share/omarchy/themes" / name,
+              Path("/usr/share/omarchy/themes") / name):
+        f = d / "colors.toml"
+        if name and f.is_file():
+            m = f.stat().st_mtime
+            if _theme_cache.get("key") == (str(f), m):
+                return _theme_cache["val"]
+            with open(f, "rb") as fh:
+                c = tomllib.load(fh)
+            val = {"name": name, "colors": {k: v for k, v in c.items() if isinstance(v, str) and v.startswith("#")}}
+            _theme_cache.update(key=(str(f), m), val=val)
+            return val
+    return {"name": name, "colors": {}}
+
+
+_bg_cache: dict = {}
+
+
+def background_file() -> Path | None:
+    try:
+        f = (OMARCHY_CURRENT / "background").resolve(strict=True)
+        return f if f.is_file() else None
+    except OSError:
+        return None
+
+
+def background_info() -> dict | None:
+    f = background_file()
+    if not f:
+        return None
+    return {"name": f.name, "v": f"{f.name}:{f.stat().st_mtime_ns}"}
+
+
+def background_image(max_w: int = 3840, name: str = "") -> tuple[bytes, str] | None:
+    f = background_file()
+    if name:   # a preview of another background of the current theme (?bg= on the page)
+        d = OMARCHY_CURRENT / "theme/backgrounds"
+        f = next((x for x in d.glob("*") if x.name == name or x.stem == name), None) if "/" not in name else None
+    if not f:
+        return None
+    key = (str(f), f.stat().st_mtime_ns)
+    if _bg_cache.get("key") == key:
+        return _bg_cache["val"]
+    cache = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omarchy-pulse"
+    out = cache / f"bg-{f.stem}-{key[1]}.jpg"
+    if not out.is_file():
+        cache.mkdir(parents=True, exist_ok=True)
+        for old in cache.glob(f"bg-{f.stem}-*.jpg"):   # older versions of this same photo
+            old.unlink(missing_ok=True)
+        try:
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(f), "-vf", f"scale='min({max_w},iw)':-2",
+                            "-q:v", "2", str(out)], timeout=90, check=True, stdin=subprocess.DEVNULL)
+        except Exception as e:   # noqa: BLE001
+            log(f"background: {e}")
+            ctype = {".png": "image/png", ".webp": "image/webp"}.get(f.suffix.lower(), "image/jpeg")
+            return f.read_bytes(), ctype
+    val = (out.read_bytes(), "image/jpeg")
+    _bg_cache.update(key=key, val=val)
+    return val
+
+
+def hypr_env() -> dict:
+    env = dict(os.environ)
+    rt = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig or not (Path(rt) / "hypr" / sig).is_dir():
+        try:
+            dirs = sorted((Path(rt) / "hypr").iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            if dirs:
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = dirs[0].name
+        except Exception:   # noqa: BLE001
+            pass
+    return env
+
+
+def hypr_socket() -> str | None:
+    env = hypr_env()
+    rt = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    p = Path(rt) / "hypr" / sig / ".socket2.sock"
+    return str(p) if p.exists() else None
+
+
+# ---------------------------------------------------------------- HTTP (127.0.0.1 only)
+
+def make_handler(hub: Hub, tok: str, port: int):
+    hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+             ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".ttf": "font/ttf", ".png": "image/png"}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code: int, body: bytes, ctype: str = "application/json", cache: bool = False) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _ok(self) -> bool:
+            if self.headers.get("Host") not in hosts:   # DNS rebinding: only our own address
+                self._send(403, b'{"error":"host"}')
+                return False
+            return True
+
+        def _authed(self, q: dict) -> bool:
+            got = self.headers.get("X-Pulse-Token") or q.get("token", "")
+            if not secrets.compare_digest(str(got), tok):
+                self._send(401, b'{"error":"token"}')
+                return False
+            return True
+
+        def do_GET(self):
+            if not self._ok():
+                return
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            path = u.path
+            if path == "/api/state":
+                if self._authed(q):
+                    self._send(200, json.dumps(hub.state(), separators=(",", ":")).encode())
+                return
+            if path.startswith("/img/"):
+                if not self._authed(q):
+                    return
+                if hub.privacy():
+                    self._send(204, b"")
+                    return
+                img = hub.images.get(urllib.parse.unquote(path[5:]))
+                if not img:
+                    self._send(404, b"{}")
+                    return
+                self._send(200, img[0], img[1])
+                return
+            if path == "/bg":
+                if not self._authed(q):
+                    return
+                img = background_image(name=q.get("name", ""))
+                if not img:
+                    self._send(404, b"{}")
+                    return
+                self._send(200, img[0], img[1], cache=True)
+                return
+            name = "index.html" if path in ("/", "") else path.lstrip("/")
+            f = (WEB / name).resolve()
+            if WEB.resolve() not in f.parents or not f.is_file():
+                self._send(404, b"{}")
+                return
+            self._send(200, f.read_bytes(), types.get(f.suffix, "application/octet-stream"), cache=f.suffix == ".ttf")
+
+        def do_POST(self):
+            if not self._ok():
+                return
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            if not self._authed(q):
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0 or n > 8_000_000:
+                self._send(413, b"{}")
+                return
+            body = self.rfile.read(n)
+            if u.path.startswith("/api/push/"):
+                q["_ctype"] = self.headers.get("Content-Type", "")
+                hub.push(urllib.parse.unquote(u.path[10:]), body, q)
+                self._send(200, b'{"ok":true}')
+            elif u.path == "/api/privacy":
+                v = body.decode().strip()
+                hub.privacy_manual = {"on": True, "off": False, "auto": None}.get(v, not hub.privacy())
+                self._send(200, json.dumps({"privacy": hub.privacy()}).encode())
+            elif u.path == "/api/reload":
+                hub.reload(force=True)
+                self._send(200, b'{"ok":true}')
+            else:
+                self._send(404, b"{}")
+    return H
+
+
+def serve(hub: Hub, port: int) -> ThreadingHTTPServer:
+    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(hub, token(), port))
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# ---------------------------------------------------------------- the wallpaper window (GTK3 + layer shell + WebKit)
+
+def run_wall(url: str, gpu: str = "auto") -> int:
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GtkLayerShell", "0.1")
+        try:
+            gi.require_version("WebKit2", "4.1")
+        except ValueError:
+            gi.require_version("WebKit2", "4.0")
+        from gi.repository import Gdk, GLib, Gtk, GtkLayerShell, WebKit2
+    except Exception as e:   # noqa: BLE001
+        log(f"missing dependencies ({e}): run extras/install-live again")
+        return 77
+    if not GtkLayerShell.is_supported():
+        log("this session does not support the layer shell (not Wayland/Hyprland?)")
+        return 1
+    disp = Gdk.Display.get_default()
+    wins = []
+    ctx = WebKit2.WebContext.get_default()
+    try:
+        ctx.set_cache_model(WebKit2.CacheModel.DOCUMENT_VIEWER)
+    except Exception:   # noqa: BLE001
+        pass
+    for i in range(disp.get_n_monitors()):
+        mon = disp.get_monitor(i)
+        g = mon.get_geometry()
+        win = Gtk.Window()
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, "omarchy-pulse")
+        GtkLayerShell.set_layer(win, GtkLayerShell.Layer.BOTTOM)   # above the still wallpaper, below every window
+        GtkLayerShell.set_monitor(win, mon)
+        for e in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM, GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(win, e, True)
+        GtkLayerShell.set_exclusive_zone(win, -1)
+        try:
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)
+        except Exception:   # noqa: BLE001
+            GtkLayerShell.set_keyboard_interactivity(win, False)
+        wv = WebKit2.WebView()
+        wv.set_background_color(Gdk.RGBA(0.02, 0.03, 0.06, 1))
+        st = wv.get_settings()
+        st.set_enable_developer_extras(False)
+        # gpu = "auto" (WebKit decides; no GPU device -> CPU drawing, cheaper than a software GL), "always", "never"
+        try:
+            pol = (os.environ.get("PULSE_GPU") or gpu or "auto").upper()
+            if pol == "AUTO" and not list(Path("/dev/dri").glob("renderD*")):
+                pol = "NEVER"
+            if pol in ("ALWAYS", "NEVER"):
+                st.set_hardware_acceleration_policy(getattr(WebKit2.HardwareAccelerationPolicy, pol))
+        except Exception:   # noqa: BLE001
+            pass
+        wv.connect("context-menu", lambda *a: True)
+        wv.load_uri(f"{url}&mx={g.x}&my={g.y}&mon={i}&primary={1 if i == 0 else 0}" + os.environ.get("PULSE_URL_EXTRA", ""))
+
+        def crashed(view, *a):   # the web process died: load the page again
+            GLib.timeout_add_seconds(2, lambda: (view.reload(), False)[1])
+            return True
+        wv.connect("web-process-terminated", crashed)
+        win.add(wv)
+        win.show_all()
+        wins.append(win)
+
+    def monitors_changed(*a):
+        log("monitors changed: restarting")
+        Gtk.main_quit()
+    disp.connect("monitor-added", monitors_changed)
+    disp.connect("monitor-removed", monitors_changed)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, Gtk.main_quit)
+    Gtk.main()
+    return 1   # the unit starts it again (a monitor came or went)
+
+
+# ---------------------------------------------------------------- demo data (serve --demo): for previews and videos
+
+def from_demo(hub: Hub) -> None:
+    import math
+    import random
+    rnd = random.Random(7)
+    demo_dir = Path(os.environ.get("PULSE_DEMO_DIR", HERE / "demo"))
+    # PULSE_DEMO_SCENE=starbase: demo data for videos of the Starship theme's scene: clear sky over Starbase, only the
+    # system, network and weather panels (no repos, projects or names), nothing in the centre (the rocket is there)
+    # and no random alerts (the scene's tour has its own)
+    sb = os.environ.get("PULSE_DEMO_SCENE") == "starbase"
+    hub.theme = read_theme() if theme_name() else {"name": "pulse", "colors": {}}
+    hub.weather = {"city": "Berlin", "temp": 6.4, "feels": 3.9, "code": 61, "wind": 14, "hum": 82, "day": 0, "rain": 0.4,
+                   "hi": 9.1, "lo": 3.2, "sunrise": "07:12", "sunset": "16:31", "unit": "°C", "windUnit": "km/h",
+                   "hours": [{"h": f"{(21 + i) % 24:02d}", "t": round(6 - i * 0.2 + math.sin(i / 3), 1),
+                              "p": int(max(0, 70 - abs(i - 4) * 9)), "c": 61 if 1 < i < 8 else (3 if i < 14 else 0)}
+                             for i in range(24)]}
+
+    def tick():
+        k = 0
+        cams = sorted(demo_dir.glob("cam*")) if demo_dir.is_dir() else []
+        frames = {c.name: sorted(c.glob("*.jpg")) for c in cams if c.is_dir()}
+        while True:
+            t = time.time()
+            cpu = max(2.0, min(98.0, 28 + 22 * math.sin(t / 7) + 10 * math.sin(t / 1.7) + rnd.random() * 6))
+            cores = [max(2, min(99, cpu + 25 * math.sin(t / (3 + i) + i) + rnd.random() * 8)) for i in range(16)]
+            rx = 2.5e6 * (1.2 + math.sin(t / 5)) + rnd.random() * 4e5
+            tx = 3e5 * (1.1 + math.cos(t / 4))
+            with hub.lock:
+                hub.sys = {"cpu": round(cpu, 1), "cores": [round(c, 1) for c in cores], "ram": 41.6,
+                           "ramUsed": 26.6e9, "ramTotal": 64e9, "swap": 0, "gpu": round(18 + 9 * math.sin(t / 5), 1),
+                           "temp": round(52 + cpu / 6, 1), "disk": 63.2, "diskFree": 7.1e11, "load": ["2.31", "1.87", "1.52"],
+                           "uptime": 3 * 86400 + 4 * 3600 + 17 * 60 + (t % 3600), "rx": rx, "tx": tx,
+                           "bat": None, "ip": "10.0.0.42", "host": "omarchy", "user": "you"}
+                for key, v in (("cpu", cpu), ("rx", rx), ("tx", tx), ("ram", 41.6), ("gpu", hub.sys["gpu"]),
+                               ("temp", hub.sys["temp"])):
+                    hub.hist[key].append(round(v, 1))
+            pw = 1.9 + 0.8 * math.sin(t / 9) + rnd.random() * 0.2
+            if not sb:
+                hub.set_widget("power", title="home · power", type="stat", slot="left", order=30, icon="󱐋",
+                               data={"value": round(pw, 2), "unit": "kW", "note": "solar 2.4 kW · grid −0.5 kW"})
+            for name, fl in frames.items():
+                if fl:
+                    body = fl[k % len(fl)].read_bytes()
+                    hub.put_image({"name": name, "title": name.replace("cam-", "cam · "), "slot": "right", "order": 20,
+                                   "camera": "demo", "private": True}, body, "image/jpeg")
+            k += 1
+            time.sleep(2)
+
+    if sb:
+        hub.weather = {"city": "Starbase", "temp": 24.6, "feels": 25.3, "code": 0, "wind": 18, "hum": 68, "day": 1, "rain": 0,
+                       "hi": 27.2, "lo": 19.4, "sunrise": "07:02", "sunset": "18:21", "unit": "°C", "windUnit": "km/h",
+                       "hours": [{"h": f"{(9 + i) % 24:02d}", "t": round(22 + 4 * math.sin((i - 2) / 4), 1), "p": 0,
+                                  "c": 0 if i % 7 else 1} for i in range(24)]}
+        hub.set_widget("ticker", title="feeds", type="list", slot="ticker",
+                       data={"items": [{"title": "Omarchy Pulse · starbase scene"}, {"title": "every core is an engine"},
+                                       {"title": "Starship theme · live wallpaper"}]})
+    else:
+        hub.set_widget("ai", title="ai · morning brief", type="text", slot="center", order=10, icon="󰚩",
+                           data={"text": "3 PRs need your review on omarchytv; CI is green.\n"
+                                         "Omarchy 4.5 is out: 412 commits, new shell, Lua config.\n"
+                                         "Rain until 23:00, clear tomorrow. Backup finished at 04:12 (38 GB).\n"
+                                         "Nothing urgent in your inbox."})
+        hub.set_widget("homelab", title="homelab", type="status", slot="right", order=40, icon="󰒋",
+                       data={"items": [{"title": "gateway", "level": "ok", "note": "1 ms"},
+                                       {"title": "nas", "level": "ok", "note": "4 ms"},
+                                       {"title": "proxmox", "level": "ok", "note": "2 ms"},
+                                       {"title": "pihole", "level": "ok", "note": "1 ms"},
+                                       {"title": "home-assistant", "level": "ok", "note": "3 ms"},
+                                       {"title": "vpn", "level": "warn", "note": "slow 180 ms"}]})
+        hub.set_widget("github", title="github", type="list", slot="right", order=30, icon="",
+                       data={"items": [{"title": "Review requested: Live overscan fix", "text": "piermark/omarchytv · PR",
+                                        "t": time.time() - 600, "level": "warn"},
+                                       {"title": "basecamp/omarchy · v4.5.0", "text": "release", "t": time.time() - 7200,
+                                        "level": "info"},
+                                       {"title": "Lua config: autostart docs", "text": "basecamp/omarchy · dhh",
+                                        "t": time.time() - 9000}]})
+        hub.set_widget("containers", title="docker", type="kv", slot="left", order=40, icon="",
+                       data={"rows": [["immich", "up 3d"], ["jellyfin", "up 3d"], ["go2rtc", "up 1d"], ["n8n", "up 6h"]]})
+        hub.set_widget("deploy", title="deploy · omarchytv", type="gauge", slot="left", order=35, icon="󰑮",
+                       data={"value": 72, "unit": "%", "note": "building webos ipk · step 4/6"})
+        hub.set_widget("notifications", title="notifications", type="list", slot="center", order=40, private=True,
+                           data={"items": [{"title": "Build finished", "text": "omarchy-iso · 4m 12s", "right": "liftoff"},
+                                           {"title": "Calendar", "text": "Team call in 15 minutes", "right": "calendar"},
+                                           {"title": "Battery of the doorbell low", "text": "18 %", "right": "home"}]})
+        hub.set_widget("ticker", title="feeds", type="list", slot="ticker",
+                       data={"items": [{"title": "Omarchy Pulse · demo data"},
+                                       {"title": "BTC 71,240 $ ▲ 1.2%"}, {"title": "next: standup 09:30"},
+                                       {"title": "Omarchy 4.5 released"}]})
+    threading.Thread(target=tick, daemon=True).start()
+
+    def alerts():
+        n = 0
+        while True:
+            time.sleep(int(os.environ.get("PULSE_DEMO_ALERT", "25")))
+            n += 1
+            hub.set_widget("motion", title="cam · garden", type="text", slot="ticker", level=None, data={"text": ""})
+            hub.set_widget("motion", level="crit" if n % 2 else "warn",
+                           data={"text": "motion detected at the gate" if n % 2 else "door left open · garage"})
+            time.sleep(3)
+            hub.set_widget("motion", level="ok")
+    if not sb:
+        threading.Thread(target=alerts, daemon=True).start()
+
+
+# ---------------------------------------------------------------- CLI
+
+def port_of(cfg: dict | None = None) -> int:
+    cfg = cfg if cfg is not None else load_config()
+    return int(os.environ.get("PULSE_PORT") or (cfg.get("pulse") or {}).get("port") or DEFAULT_PORT)
+
+
+def client(method: str, path: str, body: bytes = b"", ctype: str = "text/plain") -> dict:
+    port = port_of()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=body if method == "POST" else None,
+                                 method=method, headers={"X-Pulse-Token": token(), "Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "help"
+    if cmd in ("run", "serve"):
+        demo = "--demo" in argv
+        hub = Hub(demo=demo)
+        port = port_of()
+        try:
+            serve(hub, port)
+        except OSError as e:
+            log(f"port {port} busy ({e}): is Pulse already running? (systemctl --user status omarchy-pulse)")
+            return 1
+        hub.start()
+        url = f"http://127.0.0.1:{port}/?token={token()}"
+        log(f"Omarchy Pulse {VERSION} on http://127.0.0.1:{port}/" + (" (demo data)" if demo else ""))
+        if cmd == "serve":
+            print(url, flush=True)
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                return 0
+        return run_wall(url, str(hub.conf("pulse", "gpu", default="auto")))
+    if cmd == "push":
+        if len(argv) < 4:
+            print("usage: omarchy-pulse push NAME VALUE|- [--title T] [--type T] [--level L] [--slot S]")
+            return 2
+        name, value = argv[2], argv[3]
+        opts = {}
+        rest = argv[4:]
+        for i, a in enumerate(rest):
+            if a.startswith("--") and i + 1 < len(rest):
+                opts[a[2:]] = rest[i + 1]
+        if value == "-":
+            body = sys.stdin.buffer.read()
+        elif Path(value).is_file() and Path(value).suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            body = Path(value).read_bytes()
+            opts.setdefault("_img", Path(value).suffix.lower().lstrip(".").replace("jpg", "jpeg"))
+        else:
+            body = value.encode()
+        img = opts.pop("_img", None)
+        qs = urllib.parse.urlencode(opts)
+        try:
+            client("POST", f"/api/push/{urllib.parse.quote(name)}?{qs}", body, f"image/{img}" if img else "text/plain")
+        except Exception as e:   # noqa: BLE001
+            print(f"omarchy-pulse is not running? ({e})", file=sys.stderr)
+            return 1
+        return 0
+    if cmd == "privacy":
+        v = argv[2] if len(argv) > 2 else "toggle"
+        try:
+            print("privacy:", "on" if client("POST", "/api/privacy", v.encode())["privacy"] else "off")
+        except Exception as e:   # noqa: BLE001
+            print(f"omarchy-pulse is not running? ({e})", file=sys.stderr)
+            return 1
+        return 0
+    if cmd == "reload":
+        try:
+            client("POST", "/api/reload")
+            print("reloaded")
+        except Exception as e:   # noqa: BLE001
+            print(f"omarchy-pulse is not running? ({e})", file=sys.stderr)
+            return 1
+        return 0
+    if cmd == "doctor":
+        ok = True
+        print(f"Omarchy Pulse {VERSION}")
+        for mod, pkg in (("Gtk 3.0", "gtk3"), ("GtkLayerShell 0.1", "gtk-layer-shell"), ("WebKit2 4.1", "webkit2gtk-4.1")):
+            r = subprocess.run([sys.executable, "-c", f"import gi; gi.require_version('{mod.split()[0]}', '{mod.split()[1]}');"
+                                f"from gi.repository import {mod.split()[0]}"], capture_output=True)
+            print(("  ok   " if r.returncode == 0 else "  MISS ") + f"{mod:20} ({pkg})")
+            ok &= r.returncode == 0
+        for tool, why in (("ffmpeg", "cameras"), ("playerctl", "now playing"), ("gh", "GitHub notifications"),
+                          ("makoctl", "notifications"), ("hyprctl", "calm down under windows, privacy")):
+            print(("  ok   " if shutil.which(tool) else "  --   ") + f"{tool:20} ({why})")
+        cfg = load_config()
+        if cfg.get("_error"):
+            print("  ERR  pulse.toml: " + cfg["_error"])
+            ok = False
+        else:
+            print(f"  ok   {CONF} ({len(cfg.get('source', []))} sources)")
+        print(f"  theme: {theme_name() or '?'}")
+        return 0 if ok else 1
+    print(__doc__)
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

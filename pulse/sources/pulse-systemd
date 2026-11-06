@@ -1,0 +1,15 @@
+#!/bin/bash
+# Omarchy Pulse source: failed systemd units (system and user) as status tiles.
+# (c) 2026 Marco Porro (x.com/MarcoPorro), MIT
+items=()
+for scope in system user; do
+  flag=(); [[ $scope == user ]] && flag=(--user)
+  mapfile -t failed < <(systemctl "${flag[@]}" --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | grep .)
+  if (( ${#failed[@]} )); then
+    for u in "${failed[@]:0:5}"; do items+=("{\"title\":\"${u%.service}\",\"level\":\"crit\",\"note\":\"$scope · failed\"}"); done
+  else
+    n=$(systemctl "${flag[@]}" list-units --type=service --state=running --no-legend --plain 2>/dev/null | wc -l)
+    items+=("{\"title\":\"$scope\",\"level\":\"ok\",\"note\":\"$n running\"}")
+  fi
+done
+(IFS=,; printf '{"items":[%s]}\n' "${items[*]}")

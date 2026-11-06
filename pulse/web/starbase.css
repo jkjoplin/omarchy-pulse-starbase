@@ -1,0 +1,37 @@
+/* Starbase (photo) and launchpad (drawn) scenes. Colours follow the Omarchy theme. */
+/* the photo: the current Omarchy background at full resolution, under the scene canvas (which is screened over it) */
+#sb-photo { position: fixed; inset: 0; background: center / cover no-repeat; }
+#sb-gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }   /* the photo through WebGL (photo-gl.js) */
+#sb-scrim { position: fixed; inset: 0; pointer-events: none;   /* keeps the clock and panels readable on bright skies */
+  background: linear-gradient(180deg, rgba(var(--bg-rgb), .55) 0%, rgba(var(--bg-rgb), .2) 30%, rgba(var(--bg-rgb), 0) 52%, rgba(var(--bg-rgb), .35) 100%); }
+body:not([data-scene="starbase"]) #sb-photo, body:not([data-scene="starbase"]) #sb-scrim, body:not([data-scene="starbase"]) #sb-gl { display: none; }
+body[data-scene="starbase"] #scene { mix-blend-mode: screen; }
+
+/* the engine ring under the pad: every core is an engine */
+#sb-hud { position: fixed; left: 50%; bottom: 4.6rem; transform: translateX(-50%); display: flex; align-items: center;
+  gap: 2.4rem; pointer-events: none; }
+body:not([data-scene="starbase"]):not([data-scene="launchpad"]) #sb-hud, body.sceneonly #sb-hud { display: none; }
+body.busy #sb-hud { opacity: .9; }
+#sb-hud .sb-stat { display: flex; flex-direction: column; min-width: 8.5rem; gap: .2rem; }
+#sb-hud .sb-l { align-items: flex-end; text-align: right; }
+#sb-hud .k { font-size: .72rem; letter-spacing: .34em; text-transform: uppercase; color: rgba(var(--fg-rgb), .55); }
+#sb-hud .v { font-size: 2rem; font-weight: 300; line-height: 1; color: var(--fg); text-shadow: 0 0 1.2rem rgba(var(--accent-rgb), .35); }
+#sb-hud .sb-ring { position: relative; width: 7.4rem; height: 7.4rem; }
+#sb-hud svg { width: 100%; height: 100%; overflow: visible; }
+#sb-hud .rim { fill: rgba(var(--bg-rgb), .55); stroke: rgba(var(--accent-rgb), .35); stroke-width: .8; }
+#sb-hud .e { fill: var(--accent); stroke: rgba(var(--accent-rgb), .75); stroke-width: .9; }
+#sb-hud .e.hot { fill: #fff1d6; }
+#sb-hud .e.crit { fill: var(--crit); stroke: var(--crit); }
+#sb-hud .e.idle { stroke: rgba(var(--fg-rgb), .3); }
+#sb-hud .cap { position: absolute; left: 50%; top: 100%; transform: translateX(-50%); margin-top: .45rem; white-space: nowrap;
+  font-size: .66rem; letter-spacing: .3em; text-transform: uppercase; color: rgba(var(--fg-rgb), .45); }
+
+/* the tour (?tour=1): a caption above the engine ring */
+#sb-tour { position: fixed; left: 50%; bottom: 14.2rem; transform: translateX(-50%); text-align: center; pointer-events: none;
+  opacity: 0; transition: opacity .6s; white-space: nowrap; padding: .9rem 1.8rem .8rem;
+  background: linear-gradient(180deg, rgba(var(--bg-rgb), .78), rgba(var(--bg-rgb), .62)); border: 1px solid rgba(var(--accent-rgb), .32); }
+#sb-tour.on { opacity: 1; }
+#sb-tour .t { font-size: 1.35rem; letter-spacing: .42em; text-transform: uppercase; color: var(--accent); text-shadow: 0 0 1rem rgba(0,0,0,.9), 0 0 .2rem rgba(0,0,0,.9); }
+#sb-tour .s { margin-top: .45rem; font-size: 1.05rem; color: rgba(var(--fg-rgb), .9); text-shadow: 0 0 .8rem rgba(0,0,0,.95), 0 0 .2rem rgba(0,0,0,.9); }
+#sb-tour .bar { width: 22rem; height: 2px; margin: .8rem auto 0; background: rgba(var(--fg-rgb), .2); }
+#sb-tour .bar i { display: block; height: 100%; width: 0; background: var(--accent); box-shadow: 0 0 .5rem var(--accent); }

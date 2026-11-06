@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Omarchy Pulse source: an AI reads what is on your wallpaper right now and writes the brief.
+
+   pulse-ai claude -p                      Claude Code
+   pulse-ai ollama run llama3.2            a local model (nothing leaves the PC)
+   pulse-ai codex exec                     OpenAI Codex CLI
+   pulse-ai gemini -p                      Gemini CLI
+   pulse-ai --ask "anything to watch on the servers?" claude -p
+   pulse-ai --dry-run                      print the prompt it would send, and stop
+
+Any CLI that takes a prompt as its last argument and prints text works. Panels marked private = true
+(cameras, notifications, ...) are left out unless you add --private. Use it in pulse.toml:
+
+   [[source]]
+   name = "ai"
+   title = "ai · brief"
+   command = "pulse-ai claude -p"
+   every = 1800
+   timeout = 180
+
+(c) 2026 Marco Porro (x.com/MarcoPorro), MIT.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ME = os.environ.get("PULSE_AI_SELF", "ai")   # this panel itself is never part of its own brief
+
+
+def state() -> dict:
+    conf = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-pulse"
+    tok = (conf / "token").read_text().strip()
+    port = os.environ.get("PULSE_PORT", "47800")
+    try:
+        import tomllib
+        with open(conf / "pulse.toml", "rb") as f:
+            port = str((tomllib.load(f).get("pulse") or {}).get("port") or port)
+    except Exception:   # noqa: BLE001
+        pass
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state", headers={"X-Pulse-Token": tok,
+                                                                               "Host": f"127.0.0.1:{port}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def gb(n) -> str:
+    return f"{(n or 0) / 1e9:.1f} GB"
+
+
+def describe(s: dict, private: bool) -> str:
+    out = []
+    y = s.get("sys") or {}
+    if y:
+        out.append(f"PC {y.get('host', '')}: CPU {y.get('cpu')}%, RAM {y.get('ram')}% ({gb(y.get('ramUsed'))} of "
+                   f"{gb(y.get('ramTotal'))}), GPU {y.get('gpu')}%, temperature {y.get('temp')} °C, disk {y.get('disk')}% used, "
+                   f"load {' '.join(y.get('load') or [])}, up {int((y.get('uptime') or 0) // 3600)} h")
+        if y.get("bat"):
+            out.append(f"battery {y['bat'].get('pct')}% {y['bat'].get('status', '')}")
+    w = s.get("weather") or {}
+    if w and not w.get("error"):
+        hours = w.get("hours") or []
+        rain = max([h.get("p", 0) for h in hours[:12]] or [0])
+        out.append(f"weather in {w.get('city')}: {w.get('temp')}{w.get('unit')}, code {w.get('code')}, "
+                   f"high {w.get('hi')} low {w.get('lo')}, rain chance next 12h {rain}%, sunset {w.get('sunset')}")
+    for wd in s.get("widgets") or []:
+        if wd.get("id") == ME or (wd.get("private") and not private) or wd.get("type") == "image":
+            continue
+        d = wd.get("data") or {}
+        head = f"[{wd.get('title') or wd.get('id')}]" + (f" level={wd['level']}" if wd.get("level") else "")
+        if wd.get("error"):
+            head += f" error: {wd['error']}"
+        if "value" in d:
+            out.append(f"{head} {d['value']} {d.get('unit', '')} {d.get('note', '')}".strip())
+        elif d.get("items"):
+            items = "; ".join(f"{i.get('title', '')}" + (f" ({i['level']})" if i.get("level") else "") +
+                              (f" - {i['text']}" if i.get("text") else "") + (f" {i['note']}" if i.get("note") else "")
+                              for i in d["items"][:8])
+            out.append(f"{head} {items}")
+        elif d.get("rows"):
+            out.append(f"{head} " + "; ".join(f"{a}: {b}" for a, b in d["rows"][:10]))
+        elif d.get("text"):
+            out.append(f"{head} {d['text'][:600]}")
+    alerts = [a for a in (s.get("alerts") or []) if time.time() - a.get("t", 0) < 6 * 3600]
+    for a in alerts[-5:]:
+        out.append(f"alert {a.get('level')}: {a.get('title')} - {a.get('text')} ({int((time.time() - a['t']) // 60)} min ago)")
+    return "\n".join(out)
+
+
+def main(argv: list) -> int:
+    private = "--private" in argv
+    dry = "--dry-run" in argv
+    ask = None
+    args = [a for a in argv if a not in ("--private", "--dry-run")]
+    if "--ask" in args:
+        i = args.index("--ask")
+        ask = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    try:
+        facts = describe(state(), private)
+    except Exception as e:   # noqa: BLE001
+        print(f"Pulse is not answering ({e})")
+        return 1
+    now = time.strftime("%A %d %B %Y, %H:%M")
+    prompt = ("You write the AI panel of a live desktop wallpaper (Omarchy Pulse). Below is everything the wallpaper "
+              f"shows right now ({now}). " +
+              (f"Answer this: {ask} " if ask else
+               "Tell the owner what deserves attention first (problems, alerts, anything unusual), then one useful "
+               "note (weather, what is running). If all is fine, say so plainly. ") +
+              "At most 4 short lines, plain text, no markdown, no greetings, no lists with symbols, "
+              "in the language of the owner if obvious, otherwise English.\n\n" + facts)
+    if dry or not args:
+        print(prompt)
+        return 0
+    try:
+        r = subprocess.run(args + [prompt], capture_output=True, text=True, timeout=float(os.environ.get("PULSE_AI_TIMEOUT", 170)))
+    except FileNotFoundError:
+        print(f"{args[0]} is not installed")
+        return 1
+    except subprocess.TimeoutExpired:
+        print("the AI did not answer in time")
+        return 1
+    text = (r.stdout or "").strip() or (r.stderr or "").strip()[-300:]
+    print(text[:1500])
+    return 0 if r.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

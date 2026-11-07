@@ -916,10 +916,24 @@ def read_battery():
                 continue
             if (b / "scope").exists() and (b / "scope").read_text().strip() == "Device":
                 continue
-            return {"pct": int((b / "capacity").read_text()), "status": (b / "status").read_text().strip()}
+            return {"pct": battery_pct(b), "status": (b / "status").read_text().strip()}
         except Exception:   # noqa: BLE001
             pass
     return None
+
+
+def battery_pct(b: Path) -> int:
+    # The same percentage UPower (and so the Omarchy bar) shows: charge now over the battery's full charge today.
+    # Some gauges put something else in `capacity`: on Intel MacBooks it is charge over the design capacity, which
+    # reads 10+ points low on a worn battery and can never reach 100. It is only the fallback.
+    for now, full in (("energy_now", "energy_full"), ("charge_now", "charge_full")):
+        try:
+            n, f = int((b / now).read_text()), int((b / full).read_text())
+            if f > 0 and n >= 0:
+                return max(0, min(100, round(100 * n / f)))
+        except Exception:   # noqa: BLE001
+            pass
+    return int((b / "capacity").read_text())
 
 
 _ip_cache = ("", 0.0)

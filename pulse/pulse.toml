@@ -29,7 +29,8 @@ github = ["basecamp/omarchy"]    # repos to follow: latest release and commits (
 github_notifications = true      # your GitHub notifications, when `gh auth login` is done
 
 # ---------------------------------------------------------------- your sources
-# Common keys: name (unique), title, slot = left|right|center|ticker|auto, order, every (seconds), timeout,
+# Common keys: name (unique), title, slot = left|right|center|ticker|network|auto
+# (network: a status source shown inside the network panel), order, every (seconds), timeout,
 # type = auto|stat|gauge|list|status|text|kv|chart|image, private = true (hidden while sharing the screen),
 # icon (a Nerd Font glyph), notify = true (also a desktop notification on alerts),
 # warn_above / crit_above / warn_below / crit_below (numbers: the panel turns amber/red and INCOMING plays).
@@ -50,7 +51,7 @@ icon = "󰛳"
 command = "pulse-ping gateway 1.1.1.1 github.com"   # 'gateway' = your router
 every = 20
 type = "status"
-slot = "right"
+slot = "network"                 # inside the network panel, under the traffic
 
 # ---------------------------------------------------------------- examples: remove the # to turn one on
 

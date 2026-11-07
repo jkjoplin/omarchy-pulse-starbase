@@ -184,19 +184,35 @@
     return el;
   }
 
-  function netPanel(s, h) {
+  // `extra` are status sources with slot = "network": their tiles (pulse-ping, say) sit under the traffic
+  // instead of in a second card with the same name
+  function netPanel(s, h, extra) {
     var el = panel("net", "network", "󰛳");
     var b = bodyOf(el);
     if (!b._built) {
       b.innerHTML = '<div class="row"><span class="k">↓ down</span><span class="v rx"></span></div><div class="row"><span class="k">↑ up</span><span class="v tx"></span></div>' +
-        '<canvas class="spark"></canvas><div class="row"><span class="k">' + esc(s.user || "") + "@" + esc(s.host || "") + '</span><span class="v ip"></span></div>';
+        '<canvas class="spark"></canvas><div class="row"><span class="k">' + esc(s.user || "") + "@" + esc(s.host || "") + '</span><span class="v ip"></span></div><div class="netx"></div>';
       b._built = true;
     }
     $(".rx", b).textContent = bytes(s.rx, true);
     $(".tx", b).textContent = bytes(s.tx, true);
     $(".ip", b).textContent = s.ip || "offline";
     spark($(".spark", b), [{ v: h.rx, c: COL.accent }, { v: h.tx, c: COL.accent2 }], { n: 90 });
+    extra = extra || [];
+    setHTML($(".netx", b), extra.map(function (w) { return tilesHTML(w.data || {}); }).join(""));
+    var lv = function (l) { return extra.some(function (w) { return w.level === l; }); };
+    el.classList.toggle("crit", lv("crit"));
+    el.classList.toggle("warn", !lv("crit") && lv("warn"));
+    setHTML(el.querySelector(".err"), extra.filter(function (w) { return w.error; }).map(function (w) { return "⚠ " + esc(w.error); }).join("<br>"));
     return el;
+  }
+
+  function tilesHTML(d) {
+    // long names (problems, alerts) get one tile per line instead of being cut in two columns
+    var wide = (d.items || []).some(function (it) { return String(it.title || "").length > 15; });
+    return '<div class="tiles' + (wide ? " one" : "") + '">' + (d.items || []).slice(0, wide ? 6 : 12).map(function (it) {
+      return '<div class="tile ' + (it.level || "") + '"><span class="dot ' + (it.level ? "lv-" + it.level : "") + '"></span><span class="n">' + esc(it.title) + '</span><span class="m">' + esc(it.note || "") + "</span></div>";
+    }).join("") + "</div>";
   }
 
   function weatherPanel(w) {
@@ -232,11 +248,7 @@
           (it.text ? '<div class="s">' + esc(it.text) + "</div>" : "") + '</div><span class="r">' + esc(it.right || ago(it.t) || (it.value != null ? it.value + (it.unit || "") : "")) + "</span></li>";
       }).join("") + "</ul>" + (d.note ? '<div class="note">' + esc(d.note) + "</div>" : "");
     } else if (t === "status") {
-      // long names (problems, alerts) get one tile per line instead of being cut in two columns
-      var wide = (d.items || []).some(function (it) { return String(it.title || "").length > 15; });
-      html = '<div class="tiles' + (wide ? " one" : "") + '">' + (d.items || []).slice(0, wide ? 6 : 12).map(function (it) {
-        return '<div class="tile ' + (it.level || "") + '"><span class="dot ' + (it.level ? "lv-" + it.level : "") + '"></span><span class="n">' + esc(it.title) + '</span><span class="m">' + esc(it.note || "") + "</span></div>";
-      }).join("") + "</div>";
+      html = tilesHTML(d);
     } else if (t === "kv") {
       html = '<table class="kv">' + (d.rows || []).slice(0, 8).map(function (r) { return "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td></tr>"; }).join("") + "</table>";
     } else if (t === "image") {
@@ -320,14 +332,17 @@
     $("#badge").textContent = "◉ PRIVACY" + (S.screencast ? " · screen shared" : "");
     var left = [], right = [], center = [], ticker = [];
     var ui = S.ui || {};
-    if (s.cpu != null && ui.system !== false) left.push(sysPanel(s, h));
-    if (s.cpu != null && ui.network !== false) left.push(netPanel(s, h));
-    if (S.weather) right.push(weatherPanel(S.weather));
     var ws = (S.widgets || []).slice().sort(function (a, b) { return (a.order || 50) - (b.order || 50); });
+    var hasNet = s.cpu != null && ui.network !== false;
+    var intoNet = hasNet ? ws.filter(function (w) { return w.slot === "network" && w.type === "status"; }) : [];
+    if (s.cpu != null && ui.system !== false) left.push(sysPanel(s, h));
+    if (hasNet) left.push(netPanel(s, h, intoNet));
+    if (S.weather) right.push(weatherPanel(S.weather));
     var nl = 2, nr = 1;
     ws.forEach(function (w) {
       if (w.slot === "ticker") { ticker.push(w); return; }
-      var slot = w.slot;
+      if (intoNet.indexOf(w) >= 0) return;
+      var slot = w.slot === "network" ? "left" : w.slot;
       if (!slot || slot === "auto") {
         slot = w.type === "image" || w.type === "status" ? "right" : w.type === "text" ? "center" : nl <= nr ? "left" : "right";
       }
